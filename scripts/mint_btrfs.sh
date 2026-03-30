@@ -56,7 +56,7 @@ UUID=$(blkid -s UUID -o value "$ROOT_DEV" | head -1)
 [[ -z "$UUID" ]] && log_error "无法获取根分区 UUID（设备：$ROOT_DEV）"
 
 # 挂载参数
-MOUNT_OPTS="defaults,noatime,compress=zstd:3,discard=async,space_cache=v2,commit=120"
+MOUNT_OPTS="defaults,noatime,compress=zstd:3,discard=async,space_cache=v2,commit=120,x-gvfs-hide"
 
 # 目标列表 (格式: 路径:子卷名:NoCoW)
 TARGETS=(
