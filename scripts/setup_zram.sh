@@ -1,62 +1,68 @@
 #!/bin/bash
-# ZRAM 一键配置脚本（zram-generator 版）
-# 用途：使用 zstd 压缩，将部分内存作为压缩交换空间，缓解内存压力
-# 适用于：Linux Mint / Ubuntu 系列
-
+# ZRAM 一键配置脚本（传统版，适用于所有 Linux Mint 版本）
 set -euo pipefail
 
-# 颜色输出
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+[[ "$EUID" -ne 0 ]] && echo "请使用 sudo 运行" && exit 1
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+log_info() { echo "[INFO] $1"; }
+log_info "配置 ZRAM..."
 
-# 检查 root 权限
-[[ "$EUID" -ne 0 ]] && log_error "请使用 sudo 运行此脚本"
+# 创建自定义服务（不覆盖系统文件）
+sudo tee /usr/local/sbin/zram-setup <<'EOF'
+#!/bin/bash
+mem_total=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+zram_size=$((mem_total * 1024 / 2))  # 50% 内存，单位字节
 
-# 安装 zram-generator
-if ! command -v systemd-zram-setup &>/dev/null; then
-    log_info "正在安装 zram-generator..."
-    apt update && apt install -y zram-generator
-else
-    log_info "zram-generator 已安装"
+# 卸载旧设备
+swapoff /dev/zram0 2>/dev/null || true
+rmmod zram 2>/dev/null || true
+
+# 加载模块
+modprobe zram num_devices=1
+
+# 设置压缩算法（优先 zstd，否则 lz4）
+if [ -f /sys/block/zram0/comp_algorithm ]; then
+    if grep -q zstd /sys/block/zram0/comp_algorithm; then
+        echo zstd > /sys/block/zram0/comp_algorithm
+    elif grep -q lz4 /sys/block/zram0/comp_algorithm; then
+        echo lz4 > /sys/block/zram0/comp_algorithm
+    fi
 fi
 
-# 备份现有配置（如果存在）
-CONF_FILE="/etc/systemd/zram-generator.conf"
-if [[ -f "$CONF_FILE" ]]; then
-    BACKUP="${CONF_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
-    cp "$CONF_FILE" "$BACKUP"
-    log_info "已备份原有配置到 $BACKUP"
-fi
+# 设置大小
+echo $zram_size > /sys/block/zram0/disksize
 
-# 写入新配置
-log_info "配置 ZRAM：使用 50% 物理内存，zstd 压缩，优先级 100"
-cat <<EOF > "$CONF_FILE"
-[zram0]
-zram-size = ram / 2
-compression-algorithm = zstd
-swap-priority = 100
+# 启用 swap
+mkswap /dev/zram0
+swapon -p 100 /dev/zram0
 EOF
 
-# 重启 ZRAM 服务
-log_info "重启 ZRAM 服务..."
-systemctl restart systemd-zram-setup@zram0.service
+sudo chmod +x /usr/local/sbin/zram-setup
+
+# 创建 systemd 服务
+sudo tee /etc/systemd/system/zram-setup.service <<'EOF'
+[Unit]
+Description=ZRAM Setup Service
+After=local-fs.target
+Before=swap.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zram-setup
+RemainAfterExit=yes
+
+[Install]
+WantedBy=swap.target
+EOF
+
+# 启用服务
+sudo systemctl daemon-reload
+sudo systemctl enable zram-setup.service
+sudo systemctl start zram-setup.service
 
 # 验证
-log_info "验证 ZRAM 配置："
-echo "--- swap 设备 ---"
+echo "验证 ZRAM 配置："
 swapon --show
-echo "--- ZRAM 设备详情 ---"
 zramctl
 
-log_info "✅ ZRAM 配置完成！"
-log_info "说明："
-log_info "  - 使用 50% 物理内存（${mem} KB）作为 ZRAM 压缩空间"
-log_info "  - 压缩算法：zstd"
-log_info "  - 优先级：100（高于其他交换设备，如有）"
-log_info "  - 如需调整比例，请编辑 ${CONF_FILE} 并运行：systemctl restart systemd-zram-setup@zram0.service"
+echo "✅ ZRAM 配置完成！"
