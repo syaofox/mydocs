@@ -1,23 +1,6 @@
-ROOT_DEV=$(findmnt -n -o SOURCE /)
-UUID=$(blkid -s UUID -o value "$ROOT_DEV" | head -1)
-```
-
-当根文件系统是 **btrfs 子卷** 时，`findmnt` 返回的字符串会包含子卷路径，例如 `/dev/vda3[/@]`。将这个字符串直接传给 `blkid` 会导致错误（因为 `blkid` 期望一个纯设备路径，如 `/dev/vda3`），从而 `UUID` 为空，脚本因 `set -e` 而退出。
-
-## 解决方案
-
-在获取 `ROOT_DEV` 后，使用 `cut -d '[' -f1` 提取出纯设备路径。同时，为避免其他类似问题，增加错误处理和检查。
-
-下面是修复后的完整脚本（基于之前版本，仅修改 UUID 获取部分，并加入少量鲁棒性改进）。
-
----
-
-## 修复后的脚本
-
-```bash
 #!/bin/bash
 # Linux Mint Btrfs 子卷优化脚本（含 Docker btrfs 驱动配置）
-# 版本：2.2 - 修复子卷路径导致 UUID 获取失败的问题
+# 版本：2.3 - 扩展子卷隔离范围，优化 NoCoW 策略
 
 set -euo pipefail
 
@@ -59,20 +42,33 @@ UUID=$(blkid -s UUID -o value "$ROOT_DEV" | head -1)
 MOUNT_OPTS="defaults,noatime,compress=zstd:3,discard=async,space_cache=v2,commit=120,x-gvfs-hide"
 
 # 目标列表 (格式: 路径:子卷名:NoCoW)
+# 说明：
+# - 系统核心目录隔离（便于快照回滚时保留数据）
+# - 用户缓存及开发工具目录启用 NoCoW 提升性能
 TARGETS=(
+    # 系统数据隔离
+    "/opt:opt:false"
+    "/srv:srv:false"
+    "/usr/local:usr_local:false"
+    # 系统日志与缓存（日志启用 NoCoW）
     "/var/cache:var_cache:false"
-    "/var/log:var_log:false"
+    "/var/log:var_log:true"
     "/var/lib/docker:var_lib_docker:false"
     "/var/lib/libvirt/images:var_lib_images:true"
+    # 用户缓存（部分启用 NoCoW）
     "$USER_HOME/.cache:user_cache:false"
-    "$USER_HOME/.local/share/Trash:user_trash:false"
+    "$USER_HOME/.local/share/Trash:user_trash:true"       # 回收站，NoCoW 更佳
     "$USER_HOME/.local/share/uv:user_uv:false"
-    "$USER_HOME/.cargo:user_cargo:false"
+    "$USER_HOME/.cargo:user_cargo:true"
     "$USER_HOME/.rustup:user_rustup:false"
-    "$USER_HOME/.npm:user_npm_cache:false"
-    "$USER_HOME/.local/share/pnpm:user_pnpm_store:false"
+    "$USER_HOME/.npm:user_npm_cache:true"
+    "$USER_HOME/.local/share/pnpm:user_pnpm_store:true"
     "$USER_HOME/.ComfyUI/models:user_ai_models:false"
     "$USER_HOME/.cache/huggingface:user_hf_models:false"
+    # 可选：浏览器缓存（大量小文件，建议启用 NoCoW，取消注释即可）
+    "$USER_HOME/.cache/google-chrome:user_chrome_cache:true"
+    "$USER_HOME/.cache/chromium:user_chromium_cache:true"
+    "$USER_HOME/.config/BraveSoftware/Brave-Browser:brave_browser:true"
 )
 
 # 备份配置
@@ -83,7 +79,7 @@ cp -a /etc/fstab "$BACKUP_DIR/fstab"
 cp -a /etc/sysctl.d/* "$BACKUP_DIR/sysctl.d" 2>/dev/null || true
 [ -f /etc/docker/daemon.json ] && cp -a /etc/docker/daemon.json "$BACKUP_DIR/daemon.json" 2>/dev/null || true
 
-# 临时挂载点
+# 临时挂载点（btrfs 根卷）
 MNT=$(mktemp -d /tmp/btrfs_mnt_XXXXXX)
 trap 'umount -l "$MNT" 2>/dev/null; rmdir "$MNT" 2>/dev/null; exit' INT TERM EXIT
 mount "$ROOT_DEV" "$MNT" -o subvolid=5 || log_error "无法挂载 btrfs 根卷"
@@ -102,11 +98,16 @@ for t in "${TARGETS[@]}"; do
     IFS=':' read -r DIR SUBVOL_NAME NOCOW <<< "$t"
     [[ -z "$DIR" || -z "$SUBVOL_NAME" ]] && continue
 
-    mkdir -p "$DIR"
+    # 确保父目录存在
+    mkdir -p "$(dirname "$DIR")" 2>/dev/null || true
+    mkdir -p "$DIR" 2>/dev/null || true
+
+    # 对于用户目录，修正所有权（如果目录已存在且属于 root）
     if [[ "$DIR" == "$USER_HOME"* ]]; then
-        chown "$REAL_USER":"$REAL_USER" "$DIR"
+        chown "$REAL_USER":"$REAL_USER" "$DIR" 2>/dev/null || true
     fi
 
+    # 检查是否已经是子卷
     if btrfs subvolume show "$DIR" &>/dev/null; then
         log_info "✅ $DIR 已经是子卷，跳过"
         continue
@@ -114,24 +115,32 @@ for t in "${TARGETS[@]}"; do
 
     log_info "开始处理 $DIR"
 
+    # 停止相关服务
     case "$DIR" in
         "/var/lib/docker") systemctl stop docker.socket docker 2>/dev/null || true ;;
         "/var/lib/libvirt/images") systemctl stop libvirtd 2>/dev/null || true ;;
     esac
 
+    # 检查目录是否被占用（仅对非 /usr/local 等关键系统目录警告，不强制终止）
     if lsof +D "$DIR" &>/dev/null; then
         log_warn "目录 $DIR 正在被以下进程使用："
         lsof +D "$DIR" | head -5
-        echo -n "是否强制终止这些进程？(y/N) "
-        read -r ans
-        if [[ "$ans" =~ ^[Yy]$ ]]; then
-            fuser -k "$DIR" 2>/dev/null || true
-            sleep 2
+        if [[ "$DIR" == "/usr/local" || "$DIR" == "/opt" || "$DIR" == "/srv" ]]; then
+            log_warn "关键系统目录 $DIR 被占用，将跳过迁移（风险较高）"
+            continue
         else
-            log_error "请手动关闭相关进程后重试，或跳过此目录"
+            echo -n "是否强制终止这些进程？(y/N) "
+            read -r ans
+            if [[ "$ans" =~ ^[Yy]$ ]]; then
+                fuser -k "$DIR" 2>/dev/null || true
+                sleep 2
+            else
+                log_error "请手动关闭相关进程后重试，或跳过此目录"
+            fi
         fi
     fi
 
+    # 子卷路径（挂载在根卷下，前缀 @）
     SV_PATH="$MNT/@$SUBVOL_NAME"
     if [[ ! -d "$SV_PATH" ]]; then
         btrfs subvolume create "$SV_PATH" || log_error "创建子卷 $SV_PATH 失败"
@@ -140,24 +149,29 @@ for t in "${TARGETS[@]}"; do
         log_info "子卷 $SV_PATH 已存在，将复用"
     fi
 
+    # 设置 NoCoW（必须在新创建的空子卷上立即执行）
     if [[ "$NOCOW" == "true" ]]; then
         chattr +C "$SV_PATH" || log_warn "设置 NoCoW 失败，可能内核不支持"
         log_info "已为 $SV_PATH 启用 NoCoW"
     fi
 
+    # 移动原目录内容到备份，并创建新挂载点
     OLD_DIR="${DIR}_bak_$$"
     mv "$DIR" "$OLD_DIR" || log_error "无法移动 $DIR 到 $OLD_DIR"
     mkdir -p "$DIR" || log_error "无法创建新目录 $DIR"
 
+    # 保留原权限和属主
     chmod --reference="$OLD_DIR" "$DIR" 2>/dev/null || true
     chown --reference="$OLD_DIR" "$DIR" 2>/dev/null || true
 
+    # 挂载子卷
     mount "$ROOT_DEV" "$DIR" -o "subvol=@$SUBVOL_NAME,$MOUNT_OPTS" || {
         rmdir "$DIR"
         mv "$OLD_DIR" "$DIR"
         log_error "挂载子卷到 $DIR 失败，已回滚"
     }
 
+    # 复制数据
     if command -v rsync &>/dev/null; then
         rsync -aAX "$OLD_DIR"/ "$DIR"/ || {
             umount "$DIR"
@@ -176,6 +190,7 @@ for t in "${TARGETS[@]}"; do
 
     rm -rf "$OLD_DIR" || log_warn "无法删除备份目录 $OLD_DIR，请手动清理"
 
+    # 添加 fstab 条目（如果不存在）
     if ! grep -q "subvol=@$SUBVOL_NAME[ ,]" /etc/fstab; then
         echo "UUID=$UUID  $DIR  btrfs  $MOUNT_OPTS,subvol=@$SUBVOL_NAME  0  0" >> /etc/fstab
         log_info "已添加 $DIR 挂载项到 fstab"
@@ -258,3 +273,4 @@ log_info "备份文件保存在: $BACKUP_DIR"
 log_info "=========================================="
 log_warn "请重启系统以使所有挂载生效，并验证 Timeshift 是否仅备份根子卷 @"
 log_warn "重启后，检查 Docker 驱动: docker info | grep 'Storage Driver'"
+log_warn "建议检查: mount | grep btrfs 查看所有子卷挂载"
